@@ -46,7 +46,7 @@ cargo build
 
 Local config file
 ```bash
-cargo run -- -f /home/eitanyarmush/src/kagent-dev/mcp-relay/examples/config/static.json
+cargo run -- -f examples/config/static.json
 ```
 
 Remote config file
