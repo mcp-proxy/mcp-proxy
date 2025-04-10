@@ -1,12 +1,21 @@
 use crate::backend::BackendAuth;
+use crate::inbound::Listener;
 use crate::metrics::Recorder;
 use crate::outbound::openapi;
 use crate::outbound::{Target, TargetSpec};
 use crate::rbac;
+use crate::rbac::Identity;
+use crate::relay::metrics;
 use crate::xds::XdsStore;
+use a2a_sdk::AgentCard;
+use anyhow::{Context, anyhow};
+use bytes::Bytes;
+use eventsource_stream::Eventsource;
+use futures_util::TryStreamExt;
 use http::HeaderName;
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use itertools::Itertools;
+use reqwest::Body;
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::child_process::TokioChildProcess;
@@ -15,14 +24,15 @@ use rmcp::{
 	Error as McpError, RoleServer, ServerHandler, model::CallToolRequestParam, model::Tool, model::*,
 	service::RequestContext,
 };
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
-
-pub mod metrics;
 
 lazy_static::lazy_static! {
 	static ref DEFAULT_ID: rbac::Identity = rbac::Identity::default();
@@ -68,8 +78,104 @@ impl Relay {
 	}
 }
 
-// TODO: lists and gets can be macros
-impl ServerHandler for Relay {
+pub enum Response {
+	Streaming(ReceiverStream<a2a_sdk::ClientJsonRpcMessage>),
+	Single(a2a_sdk::ClientJsonRpcMessage)
+}
+
+impl Relay {
+	pub async fn fetch_agent_card(
+		&self,
+		host: String,
+		claims: Identity,
+		service_name: &str,
+	) -> anyhow::Result<AgentCard> {
+		let mut pool = self.pool.write().await;
+		let svc = pool
+			.get_or_create(service_name)
+			.await
+			.context(format!("Service {} not found", service_name))?;
+		let mut card = svc.fetch_agent_card().await?;
+		let url = {
+			let state = self.state.read().await;
+			match &state.listener {
+				Listener::A2a(a) => a.url(host),
+				_ => {
+					panic!("must be a2a")
+				},
+			}
+		};
+		card.url = format!("{}/{}", url, service_name);
+
+		let state = self.state.read().await;
+		let pols = &state.policies;
+		card.skills = card
+			.skills
+			.iter()
+			.filter(|s| {
+				// TODO for now we treat it as a 'tool'
+				let tool_name = format!("{}:{}", service_name, s.name);
+				pols.validate(&rbac::ResourceType::Tool { id: tool_name }, &claims)
+			})
+			.cloned()
+			.collect();
+		Ok(card)
+	}
+	pub async fn proxy(
+		self,
+		request: a2a_sdk::A2aRequest,
+		claims: Identity,
+		service_name: String,
+	) -> anyhow::Result<Response> {
+		use futures::StreamExt;
+		let mut pool = self.pool.write().await;
+		let svc = pool
+			.get_or_create(&service_name)
+			.await
+			.context(format!("Service {} not found", &service_name))?;
+		let client = svc.fetch_client()?;
+		let (to_client_tx, to_client_rx) =
+			tokio::sync::mpsc::channel::<a2a_sdk::ClientJsonRpcMessage>(64);
+		let resp = client.json(&request).send().await?;
+
+		let content = resp
+			.headers()
+			.get(reqwest::header::CONTENT_TYPE)
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.parse::<mime::Mime>().ok())
+			.map(|mime| mime.type_().as_str().to_string() + "/" + mime.subtype().as_str());
+		tracing::error!("howardjohn: got response code={} content_type={:?}", resp.status(), content);
+		match content.as_deref() {
+			Some(("application/json")) => {
+				let j = resp
+					.json::<a2a_sdk::ClientJsonRpcMessage>()
+					.await
+					.expect("TODO handle error");
+				Ok(Response::Single(j))
+			},
+			Some(("text/event-stream")) => {
+				tokio::spawn(async move {
+					let mut events = resp.bytes_stream().eventsource();
+
+					while let Some(thing) = events.next().await {
+						let event = thing.expect("TODO");
+						tracing::error!("howardjohn: got event {:?}", event);
+						if event.event == "message" {
+							tracing::error!("howardjohn: data: {}", event.data.to_string());
+							let j: a2a_sdk::ClientJsonRpcMessage =
+								serde_json::from_str(&event.data).expect("TODO handle error");
+							tracing::error!("howardjohn: sent {j:?}");
+							to_client_tx.send(j).await.unwrap();
+						}
+					}
+					drop(to_client_tx);
+				});
+
+				Ok(Response::Streaming(ReceiverStream::new(to_client_rx)))
+			},
+			_ => anyhow::bail!("expected JSON or event stream"),
+		}
+	}
 	#[instrument(level = "debug", skip_all)]
 	fn get_info(&self) -> ServerInfo {
 		ServerInfo {
@@ -211,12 +317,12 @@ impl ServerHandler for Relay {
 	}
 
 	#[instrument(
-    level = "debug",
-    skip_all,
-    fields(
+        level = "debug",
+        skip_all,
+        fields(
         name=%request.uri,
-    ),
-  )]
+        ),
+    )]
 	async fn read_resource(
 		&self,
 		request: ReadResourceRequestParam,
@@ -258,12 +364,12 @@ impl ServerHandler for Relay {
 	}
 
 	#[instrument(
-    level = "debug",
-    skip_all,
-    fields(
+        level = "debug",
+        skip_all,
+        fields(
         name=%request.name,
-    ),
-  )]
+        ),
+    )]
 	async fn get_prompt(
 		&self,
 		request: GetPromptRequestParam,
@@ -358,12 +464,12 @@ impl ServerHandler for Relay {
 	}
 
 	#[instrument(
-    level = "debug",
-    skip_all,
-    fields(
+        level = "debug",
+        skip_all,
+        fields(
         name=%request.name,
-    ),
-  )]
+        ),
+    )]
 	async fn call_tool(
 		&self,
 		request: CallToolRequestParam,
@@ -515,12 +621,12 @@ mod pool {
 		}
 
 		#[instrument(
-      level = "debug",
-      skip_all,
-      fields(
+            level = "debug",
+            skip_all,
+            fields(
           name=%target.name,
-      ),
-    )]
+            ),
+        )]
 		pub(crate) async fn connect(
 			&mut self,
 			ct: &tokio_util::sync::CancellationToken,
@@ -585,7 +691,6 @@ mod pool {
 					backend_auth,
 					headers,
 				} => {
-
 					tracing::info!("starting A2a transport for target: {}", target.name);
 					let client = reqwest::Client::new();
 
@@ -609,13 +714,11 @@ mod pool {
 								);
 							}
 							reqwest::Client::builder()
-							.default_headers(upstream_headers)
-							.build()
-							.unwrap()
+								.default_headers(upstream_headers)
+								.build()
+								.unwrap()
 						},
-						None => {
-							reqwest::Client::new()
-						},
+						None => reqwest::Client::new(),
 					};
 					UpstreamTarget::A2a(crate::a2a::Client {
 						url: reqwest::Url::parse(&url).expect("failed to parse url"),
@@ -670,7 +773,7 @@ enum UpstreamTarget {
 enum UpstreamError {
 	ServiceError(rmcp::ServiceError),
 	OpenAPIError(anyhow::Error),
-	Unsupported
+	Unsupported,
 }
 
 impl UpstreamError {
@@ -722,7 +825,7 @@ impl From<UpstreamError> for ErrorData {
 				rmcp::ServiceError::Transport(e) => ErrorData::internal_error(e.to_string(), None),
 				_ => ErrorData::internal_error("unknown error", None),
 			},
-			UpstreamError::Unsupported => ErrorData::internal_error("unsupported operation", None)
+			UpstreamError::Unsupported => ErrorData::internal_error("unsupported operation", None),
 		}
 	}
 }
@@ -826,5 +929,36 @@ impl UpstreamTarget {
 			},
 			UpstreamTarget::A2a(_) => Err(UpstreamError::Unsupported),
 		}
+	}
+
+	async fn fetch_agent_card(&self) -> Result<AgentCard, anyhow::Error> {
+		match self {
+			UpstreamTarget::Mcp(m) => Err(anyhow!("unsupported")),
+			UpstreamTarget::OpenAPI(m) => Err(anyhow!("unsupported")),
+			UpstreamTarget::A2a(m) => Ok(
+				m.client
+					.get(format!("{}.well-known/agent.json", m.url))
+					.header("Content-type", "application/json")
+					.send()
+					.await?
+					.json()
+					.await?,
+			),
+		}
+	}
+	fn fetch_client(&self) -> Result<reqwest::RequestBuilder, anyhow::Error> {
+		match self {
+			UpstreamTarget::Mcp(m) => Err(anyhow!("unsupported")),
+			UpstreamTarget::OpenAPI(m) => Err(anyhow!("unsupported")),
+			UpstreamTarget::A2a(m) => Ok(m.client.post(m.url.clone())),
+		}
+	}
+}
+
+struct SerializeStream<T>(T);
+
+impl<T: Serialize> Into<bytes::Bytes> for SerializeStream<T> {
+	fn into(self) -> Bytes {
+		Bytes::from(serde_json::to_vec(&self.0).unwrap())
 	}
 }

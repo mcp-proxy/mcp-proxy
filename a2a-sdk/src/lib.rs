@@ -2,9 +2,13 @@
 #![allow(clippy::needless_lifetimes)]
 #![allow(clippy::match_single_binding)]
 #![allow(clippy::clone_on_copy)]
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::Arc;
 
 pub mod error {
 	use std::fmt::Display;
@@ -32,45 +36,193 @@ pub mod error {
 		}
 	}
 }
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
-#[serde(transparent)]
-pub struct A2aProtocolSchema(pub ::serde_json::Value);
-impl ::std::ops::Deref for A2aProtocolSchema {
-	type Target = ::serde_json::Value;
-	fn deref(&self) -> &::serde_json::Value {
-		&self.0
+
+pub trait ConstString: Default {
+	const VALUE: &str;
+}
+#[macro_export]
+macro_rules! const_string {
+	($name:ident = $value:literal) => {
+		#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+		pub struct $name;
+
+		impl ConstString for $name {
+			const VALUE: &str = $value;
+		}
+
+		impl serde::Serialize for $name {
+			fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+			where
+				S: serde::Serializer,
+			{
+				$value.serialize(serializer)
+			}
+		}
+
+		impl<'de> serde::Deserialize<'de> for $name {
+			fn deserialize<D>(deserializer: D) -> Result<$name, D::Error>
+			where
+				D: serde::Deserializer<'de>,
+			{
+				let s: String = serde::Deserialize::deserialize(deserializer)?;
+				if s == $value {
+					Ok($name)
+				} else {
+					Err(serde::de::Error::custom(format!(concat!(
+						"expect const string value \"",
+						$value,
+						"\""
+					))))
+				}
+			}
+		}
+	};
+}
+
+const_string!(JsonRpcVersion2_0 = "2.0");
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum NumberOrString {
+	Number(u32),
+	String(Arc<str>),
+}
+
+impl NumberOrString {
+	pub fn into_json_value(self) -> Value {
+		match self {
+			NumberOrString::Number(n) => Value::Number(serde_json::Number::from(n)),
+			NumberOrString::String(s) => Value::String(s.to_string()),
+		}
 	}
 }
-impl From<A2aProtocolSchema> for ::serde_json::Value {
-	fn from(value: A2aProtocolSchema) -> Self {
-		value.0
+
+impl std::fmt::Display for NumberOrString {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			NumberOrString::Number(n) => Display::fmt(&n, f),
+			NumberOrString::String(s) => Display::fmt(&s, f),
+		}
 	}
 }
-impl From<&A2aProtocolSchema> for A2aProtocolSchema {
-	fn from(value: &A2aProtocolSchema) -> Self {
-		value.clone()
+
+impl Serialize for NumberOrString {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		match self {
+			NumberOrString::Number(n) => n.serialize(serializer),
+			NumberOrString::String(s) => s.serialize(serializer),
+		}
 	}
 }
-impl From<::serde_json::Value> for A2aProtocolSchema {
-	fn from(value: ::serde_json::Value) -> Self {
-		Self(value)
+
+impl<'de> Deserialize<'de> for NumberOrString {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let value: Value = Deserialize::deserialize(deserializer)?;
+		match value {
+			Value::Number(n) => Ok(NumberOrString::Number(
+				n.as_u64()
+					.ok_or(serde::de::Error::custom("Expect an integer"))? as u32,
+			)),
+			Value::String(s) => Ok(NumberOrString::String(s.into())),
+			_ => Err(serde::de::Error::custom("Expect number or string")),
+		}
 	}
 }
+
+pub type RequestId = NumberOrString;
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct JsonRpcRequest<R = Request> {
+	pub jsonrpc: JsonRpcVersion2_0,
+	pub id: RequestId,
+	#[serde(flatten)]
+	pub request: R,
+}
+#[derive(Debug, Clone)]
+pub struct Request<M = String, P = JsonObject> {
+	pub method: M,
+	// #[serde(skip_serializing_if = "Option::is_none")]
+	pub params: P,
+}
+
+impl<M, R> Serialize for Request<M, R>
+where
+	M: Serialize,
+	R: Serialize,
+{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		Proxy::serialize(
+			&Proxy {
+				method: &self.method,
+				params: &self.params,
+			},
+			serializer,
+		)
+	}
+}
+
+#[derive(Serialize, Deserialize)]
+struct Proxy<M, P> {
+	method: M,
+	params: P,
+}
+
+impl<'de, M, R> Deserialize<'de> for Request<M, R>
+where
+	M: Deserialize<'de>,
+	R: Deserialize<'de>,
+{
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let body = Proxy::deserialize(deserializer)?;
+		Ok(Request {
+			method: body.method,
+			params: body.params,
+		})
+	}
+}
+
+pub type JsonObject<F = Value> = serde_json::Map<String, F>;
+
+type DefaultResponse = JsonObject;
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct JsonRpcResponse<R = JsonObject> {
+	pub jsonrpc: JsonRpcVersion2_0,
+	pub id: RequestId,
+	pub result: R,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum JsonRpcMessage<Req = Request, Resp = DefaultResponse> {
+	Request(JsonRpcRequest<Req>),
+	Response(JsonRpcResponse<Resp>),
+}
+
+pub type ClientJsonRpcMessage = JsonRpcMessage<A2aRequest, A2aResponse>;
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum A2aRequest {
 	SendTaskRequest(SendTaskRequest),
+	SendSubscribeTaskRequest(SendSubscribeTaskRequest),
 	GetTaskRequest(GetTaskRequest),
-	CancelTaskRequest(CancelTaskRequest),
-	SetTaskPushNotificationRequest(SetTaskPushNotificationRequest),
-	GetTaskPushNotificationRequest(GetTaskPushNotificationRequest),
-	TaskResubscriptionRequest(TaskResubscriptionRequest),
 }
-impl From<&Self> for A2aRequest {
-	fn from(value: &A2aRequest) -> Self {
-		value.clone()
-	}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum A2aResponse {
+	SendTaskResponse(Option<Task>),
+	SendTaskUpdateResponse(SendTaskStreamingResponseResult),
 }
+
 impl From<SendTaskRequest> for A2aRequest {
 	fn from(value: SendTaskRequest) -> Self {
 		Self::SendTaskRequest(value)
@@ -81,26 +233,27 @@ impl From<GetTaskRequest> for A2aRequest {
 		Self::GetTaskRequest(value)
 	}
 }
-impl From<CancelTaskRequest> for A2aRequest {
-	fn from(value: CancelTaskRequest) -> Self {
-		Self::CancelTaskRequest(value)
-	}
-}
-impl From<SetTaskPushNotificationRequest> for A2aRequest {
-	fn from(value: SetTaskPushNotificationRequest) -> Self {
-		Self::SetTaskPushNotificationRequest(value)
-	}
-}
-impl From<GetTaskPushNotificationRequest> for A2aRequest {
-	fn from(value: GetTaskPushNotificationRequest) -> Self {
-		Self::GetTaskPushNotificationRequest(value)
-	}
-}
-impl From<TaskResubscriptionRequest> for A2aRequest {
-	fn from(value: TaskResubscriptionRequest) -> Self {
-		Self::TaskResubscriptionRequest(value)
-	}
-}
+// impl From<CancelTaskRequest> for A2aRequest {
+// 	fn from(value: CancelTaskRequest) -> Self {
+// 		Self::CancelTaskRequest(value)
+// 	}
+// }
+// impl From<SetTaskPushNotificationRequest> for A2aRequest {
+// 	fn from(value: SetTaskPushNotificationRequest) -> Self {
+// 		Self::SetTaskPushNotificationRequest(value)
+// 	}
+// }
+// impl From<GetTaskPushNotificationRequest> for A2aRequest {
+// 	fn from(value: GetTaskPushNotificationRequest) -> Self {
+// 		Self::GetTaskPushNotificationRequest(value)
+// 	}
+// }
+// impl From<TaskResubscriptionRequest> for A2aRequest {
+// 	fn from(value: TaskResubscriptionRequest) -> Self {
+// 		Self::TaskResubscriptionRequest(value)
+// 	}
+// }
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct AgentAuthentication {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,20 +507,10 @@ impl Default for GetTaskPushNotificationResponse {
 		}
 	}
 }
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
-pub struct GetTaskRequest {
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub id: Option<Id>,
-	#[serde(default = "defaults::get_task_request_jsonrpc")]
-	pub jsonrpc: String,
-	pub method: String,
-	pub params: TaskQueryParams,
-}
-impl From<&GetTaskRequest> for GetTaskRequest {
-	fn from(value: &GetTaskRequest) -> Self {
-		value.clone()
-	}
-}
+
+const_string!(GetTaskRequestMethod = "tasks/get");
+pub type GetTaskRequest = Request<GetTaskRequestMethod, TaskQueryParams>;
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct GetTaskResponse {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -656,20 +799,13 @@ impl TryFrom<String> for Role {
 		value.parse()
 	}
 }
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
-pub struct SendTaskRequest {
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub id: Option<Id>,
-	#[serde(default = "defaults::send_task_request_jsonrpc")]
-	pub jsonrpc: String,
-	pub method: String,
-	pub params: TaskSendParams,
-}
-impl From<&SendTaskRequest> for SendTaskRequest {
-	fn from(value: &SendTaskRequest) -> Self {
-		value.clone()
-	}
-}
+
+const_string!(SendTaskRequestMethod = "tasks/send");
+pub type SendTaskRequest = Request<SendTaskRequestMethod, TaskSendParams>;
+
+const_string!(SendSubscribeTaskRequestMethod = "tasks/sendSubscribe");
+pub type SendSubscribeTaskRequest = Request<SendSubscribeTaskRequestMethod, TaskSendParams>;
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct SendTaskResponse {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -740,26 +876,12 @@ impl Default for SendTaskStreamingResponse {
 #[serde(untagged)]
 #[derive(Default)]
 pub enum SendTaskStreamingResponseResult {
-	Variant0(TaskStatusUpdateEvent),
-	Variant1(TaskArtifactUpdateEvent),
+	Status(TaskStatusUpdateEvent),
+	Artifact(TaskArtifactUpdateEvent),
 	#[default]
-	Variant2,
+	None,
 }
-impl From<&Self> for SendTaskStreamingResponseResult {
-	fn from(value: &SendTaskStreamingResponseResult) -> Self {
-		value.clone()
-	}
-}
-impl From<TaskStatusUpdateEvent> for SendTaskStreamingResponseResult {
-	fn from(value: TaskStatusUpdateEvent) -> Self {
-		Self::Variant0(value)
-	}
-}
-impl From<TaskArtifactUpdateEvent> for SendTaskStreamingResponseResult {
-	fn from(value: TaskArtifactUpdateEvent) -> Self {
-		Self::Variant1(value)
-	}
-}
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct SetTaskPushNotificationRequest {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1005,7 +1127,7 @@ pub struct TaskStatus {
 	pub message: Option<Message>,
 	pub state: TaskState,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub timestamp: Option<chrono::DateTime<chrono::offset::Utc>>,
+	pub timestamp: Option<chrono::NaiveDateTime>,
 }
 impl From<&TaskStatus> for TaskStatus {
 	fn from(value: &TaskStatus) -> Self {
@@ -1021,11 +1143,7 @@ pub struct TaskStatusUpdateEvent {
 	pub metadata: Option<::serde_json::Map<String, ::serde_json::Value>>,
 	pub status: TaskStatus,
 }
-impl From<&TaskStatusUpdateEvent> for TaskStatusUpdateEvent {
-	fn from(value: &TaskStatusUpdateEvent) -> Self {
-		value.clone()
-	}
-}
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct TextPart {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1104,7 +1222,7 @@ pub mod defaults {
 		"2.0".to_string()
 	}
 	pub(super) fn send_task_streaming_response_result() -> super::SendTaskStreamingResponseResult {
-		super::SendTaskStreamingResponseResult::Variant2
+		super::SendTaskStreamingResponseResult::None
 	}
 	pub(super) fn set_task_push_notification_request_jsonrpc() -> String {
 		"2.0".to_string()
@@ -1117,5 +1235,37 @@ pub mod defaults {
 	}
 	pub(super) fn text_part_type() -> String {
 		"text".to_string()
+	}
+}
+#[cfg(test)]
+mod tests {
+	use crate::{A2aResponse, TaskStatusUpdateEvent};
+
+	#[test]
+	fn test_serde() {
+		let js = serde_json::json! {
+		{
+			"jsonrpc": "2.0",
+			"id": "d1306567eb364c7ba9e7a7b922dba672",
+			"result": {
+				"id": "8b34914c735a464986e1d5ce5b6ec478",
+				"status": {
+					"state": "completed",
+					"message": {
+						"role": "agent",
+						"parts": [
+							{
+								"type": "text",
+								"text": "Hello!"
+							}
+						]
+					},
+					"timestamp": "2025-04-10T15:07:15.833777"
+				},
+				"final": false
+			}
+		}
+		};
+		let got: crate::ClientJsonRpcMessage = serde_json::from_value(js).unwrap();
 	}
 }

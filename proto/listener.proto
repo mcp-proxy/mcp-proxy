@@ -6,30 +6,32 @@ import "common.proto";
 
 
 message Listener {
+  message TlsConfig {
+    mcpproxy.dev.common.LocalDataSource key_pem = 1;
+    mcpproxy.dev.common.LocalDataSource cert_pem = 2;
+  }
+  message Authn {
+    message JwtConfig {
+      repeated string issuer = 1;
+      repeated string audience = 2;
+      oneof jwks {
+        mcpproxy.dev.common.LocalDataSource local_jwks = 3;
+        mcpproxy.dev.common.RemoteDataSource remote_jwks = 4;
+      }
+    }
+
+    JwtConfig jwt = 1;
+  }
   message SseListener { 
     string address = 1;
     uint32 port = 2;
-
-    message TlsConfig {
-      mcpproxy.dev.common.LocalDataSource key_pem = 1;
-      mcpproxy.dev.common.LocalDataSource cert_pem = 2;
-    }
-
     TlsConfig tls = 3;
-
-    message Authn {
-      message JwtConfig {
-        repeated string issuer = 1;
-        repeated string audience = 2;
-        oneof jwks {
-          mcpproxy.dev.common.LocalDataSource local_jwks = 3;
-          mcpproxy.dev.common.RemoteDataSource remote_jwks = 4;
-        }
-      }
-
-      JwtConfig jwt = 1;
-    }
-
+    Authn authn = 4;
+  }
+  message A2aListener {
+    string address = 1;
+    uint32 port = 2;
+    TlsConfig tls = 3;
     Authn authn = 4;
   }
 
@@ -39,5 +41,6 @@ message Listener {
   oneof listener {
     SseListener sse = 1;
     StdioListener stdio = 2;
+    A2aListener a2a = 3;
   }
 }

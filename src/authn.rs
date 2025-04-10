@@ -1,5 +1,6 @@
 use crate::proto::mcpproxy::dev::common;
-use crate::proto::mcpproxy::dev::listener::listener::sse_listener;
+use crate::proto::mcpproxy::dev::listener::listener::authn;
+use crate::proto::mcpproxy::dev::listener::listener;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use serde::Serialize;
@@ -95,9 +96,9 @@ impl JwksRemoteSource {
 }
 
 impl JwtAuthenticator {
-	pub async fn new(value: &sse_listener::authn::JwtConfig) -> Result<Self, JwkError> {
+	pub async fn new(value: &authn::JwtConfig) -> Result<Self, JwkError> {
 		let (jwk, remote): (Jwk, Option<JwksRemoteSource>) = match &value.jwks {
-			Some(sse_listener::authn::jwt_config::Jwks::LocalJwks(local)) => match &local.source {
+			Some(authn::jwt_config::Jwks::LocalJwks(local)) => match &local.source {
 				Some(common::local_data_source::Source::Inline(jwk)) => {
 					let jwk: Jwk = serde_json::from_slice(jwk).map_err(JwkError::JwksParseError)?;
 					(jwk, None)
@@ -113,7 +114,7 @@ impl JwtAuthenticator {
 					));
 				},
 			},
-			Some(sse_listener::authn::jwt_config::Jwks::RemoteJwks(remote)) => {
+			Some(authn::jwt_config::Jwks::RemoteJwks(remote)) => {
 				let remote = JwksRemoteSource::from_xds(remote)?;
 				let jwk = remote.fetch_jwks().await?;
 				(jwk, Some(remote.clone()))

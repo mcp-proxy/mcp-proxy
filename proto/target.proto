@@ -12,9 +12,20 @@ message Target {
     SseTarget sse = 2;
     OpenAPITarget openapi = 3;
     StdioTarget stdio = 4;
+    A2aTarget a2a = 5;
   }
 
   message SseTarget {
+    // The host of the target.
+    string host = 1;
+    // The port of the target.
+    uint32 port = 2;
+    // The path of the target.
+    string path = 3;
+    // The headers of the target.
+    map<string, string> headers = 4;
+  }
+  message A2aTarget {
     // The host of the target.
     string host = 1;
     // The port of the target.

@@ -22,6 +22,13 @@ pub enum TargetSpec {
 		headers: HashMap<String, String>,
 		backend_auth: Option<backend::BackendAuthConfig>,
 	},
+	A2a {
+		host: String,
+		port: u32,
+		path: String,
+		headers: HashMap<String, String>,
+		backend_auth: Option<backend::BackendAuthConfig>,
+	},
 	Stdio {
 		cmd: String,
 		args: Vec<String>,

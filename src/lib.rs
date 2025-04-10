@@ -15,3 +15,5 @@ pub mod r#static;
 pub mod strng;
 pub mod version;
 pub mod xds;
+pub mod a2a;
+pub mod a2a_relay;

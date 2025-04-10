@@ -190,6 +190,13 @@ impl TryFrom<XdsTarget> for outbound::Target {
 				headers: sse.headers.clone(),
 				backend_auth: None,
 			},
+			XdsTargetSpec::A2a(a2a) => outbound::TargetSpec::A2a {
+				host: a2a.host.clone(),
+				port: a2a.port,
+				path: a2a.path.clone(),
+				headers: a2a.headers.clone(),
+				backend_auth: None,
+			},
 			XdsTargetSpec::Stdio(stdio) => outbound::TargetSpec::Stdio {
 				cmd: stdio.cmd.clone(),
 				args: stdio.args.clone(),

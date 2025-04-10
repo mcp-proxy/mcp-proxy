@@ -1,10 +1,14 @@
-use crate::authn;
+use crate::inbound::Listener;
+use crate::proto::mcpproxy::dev::target::target::Target;
 use crate::relay;
 use crate::relay::Relay;
 use crate::xds::XdsStore as AppState;
+use crate::{a2a_relay, authn};
 use crate::{proxyprotocol, rbac};
+use a2a_sdk::AgentCard;
 use anyhow::Result;
-use axum::extract::{ConnectInfo, OptionalFromRequestParts};
+use axum::extract::{ConnectInfo, OptionalFromRequestParts, Path};
+use axum::routing::post;
 use axum::{
 	Json, RequestPartsExt, Router,
 	extract::{Query, State},
@@ -13,6 +17,7 @@ use axum::{
 	response::{IntoResponse, Response},
 	routing::get,
 };
+use axum_extra::extract::{Host, JsonLines};
 use axum_extra::typed_header::TypedHeaderRejection;
 use axum_extra::{
 	TypedHeader,
@@ -21,12 +26,14 @@ use axum_extra::{
 use futures::{SinkExt, StreamExt, stream::Stream};
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::model::GetExtensions;
-use rmcp::serve_server;
+use rmcp::{ServerHandler, serve_server};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{self};
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::ReceiverStream;
+
 type SessionId = Arc<str>;
 
 fn session_id() -> SessionId {
@@ -61,9 +68,15 @@ impl App {
 			ct,
 		}
 	}
-	pub fn router(&self) -> Router {
+	pub fn mcp_router(&self) -> Router {
 		Router::new()
 			.route("/sse", get(sse_handler).post(post_event_handler))
+			.with_state(self.clone())
+	}
+	pub fn a2a_router(&self) -> Router {
+		Router::new()
+			.route("/{target}/.well-known/agent.json", get(agent_card_handler))
+			.route("/{target}", post(agent_call_handler))
 			.with_state(self.clone())
 	}
 }
@@ -239,4 +252,79 @@ async fn sse_handler(
 		}
 	}));
 	Sse::new(stream)
+}
+
+async fn agent_card_handler(
+	State(app): State<App>,
+	Path(target): Path<String>,
+	Host(host): Host,
+	ConnectInfo(_connection): ConnectInfo<proxyprotocol::Address>,
+	claims: Option<rbac::Claims>,
+) -> Result<Json<AgentCard>, StatusCode> {
+	tracing::info!("new agent card request");
+	let relay = a2a_relay::Relay::new(app.state.clone(), app.metrics.clone());
+
+	let claims = rbac::Identity::new(claims.map(|c| c.0), app.connection_id.read().await.clone());
+	let card = relay
+		.fetch_agent_card(host, claims, &target)
+		.await
+		.map_err(|e| {
+			tracing::error!("howardjohn: error: {e:?}");
+			StatusCode::INTERNAL_SERVER_ERROR
+		})?;
+
+	Ok(Json(card))
+}
+
+async fn agent_call_handler(
+	State(app): State<App>,
+	ConnectInfo(_connection): ConnectInfo<proxyprotocol::Address>,
+	Path(target): Path<String>,
+	claims: Option<rbac::Claims>,
+	// TODO: needs to be generic task
+	Json(request): Json<a2a_sdk::A2aRequest>,
+) -> Result<
+	AxumEither<
+		Sse<impl Stream<Item = Result<Event, axum::Error>>>,
+		Json<a2a_sdk::ClientJsonRpcMessage>,
+	>,
+	StatusCode,
+> {
+	tracing::info!("new agent call {request:?}");
+	let relay = a2a_relay::Relay::new(app.state.clone(), app.metrics.clone());
+	let claims = rbac::Identity::new(claims.map(|c| c.0), app.connection_id.read().await.clone());
+	let rx = relay.proxy(request, claims, target).await.map_err(|e| {
+		tracing::error!("howardjohn: error: {e:?}");
+		StatusCode::INTERNAL_SERVER_ERROR
+	})?;
+
+	match rx {
+		a2a_relay::Response::Streaming(rx) => {
+			let stream = rx.map(|message| {
+				tracing::error!("howardjohn: rx!");
+				Event::default().json_data(&message)
+			});
+			Ok(AxumEither::Left(Sse::new(stream)))
+		},
+		a2a_relay::Response::Single(item) => Ok(AxumEither::Right(Json(item))),
+	}
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, PartialOrd, Eq, Ord)]
+pub enum AxumEither<L, R> {
+	Left(L),
+	Right(R),
+}
+
+impl<L, R> IntoResponse for AxumEither<L, R>
+where
+	L: IntoResponse,
+	R: IntoResponse,
+{
+	fn into_response(self) -> Response {
+		match self {
+			Self::Left(l) => l.into_response(),
+			Self::Right(r) => r.into_response(),
+		}
+	}
 }
