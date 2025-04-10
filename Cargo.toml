@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[workspace]
+resolver = "2"
+members = [
+  "a2a-sdk"
+]
+
 [features]
 default = ["gcp"]
 gcp = ["dep:google-cloud-auth"]
